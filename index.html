@@ -29,9 +29,7 @@
 
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-segmentation@1.0.1/dist/body-segmentation.min.js"></script>
-
 <script>
-// ── WebGL Setup ────────────────────────────────────────────────
 const glCanvas = document.getElementById('glCanvas');
 const gl = glCanvas.getContext('webgl', {antialias:false});
 
@@ -51,96 +49,115 @@ const fsSource = `
   uniform sampler2D uEdge;
   uniform float uTime;
 
-  // Permutation hash
   float hash(vec2 p){
-    p = fract(p*vec2(127.1,311.7));
-    p += dot(p, p+19.19);
+    p=fract(p*vec2(127.1,311.7));
+    p+=dot(p,p+19.19);
     return fract(p.x*p.y);
   }
-
   float noise(vec2 p){
-    vec2 i=floor(p), f=fract(p);
+    vec2 i=floor(p),f=fract(p);
     vec2 u=f*f*(3.-2.*f);
-    return mix(
-      mix(hash(i),         hash(i+vec2(1,0)), u.x),
-      mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),u.x),
-      u.y
-    );
+    return mix(mix(hash(i),hash(i+vec2(1,0)),u.x),
+               mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),u.x),u.y);
   }
-
   float fbm(vec2 p, int oct){
     float v=0.,a=0.5,m=0.;
     for(int i=0;i<8;i++){
-      if(i>=oct) break;
-      v+=noise(p)*a; m+=a; a*=0.5; p*=2.1;
+      if(i>=oct)break;
+      v+=noise(p)*a;m+=a;a*=0.5;p*=2.1;
     }
     return v/m;
   }
-
   float domainWarp(vec2 uv, float t){
-    float warp=1.9;
-    vec2 q=vec2(
-      fbm(uv+vec2(sin(t*0.7)*1.2, cos(t*0.9)*1.1),4),
-      fbm(uv+vec2(cos(t*1.1)*1.0+5.2, sin(t*0.6)*1.3+1.3),4)
-    );
-    vec2 r=vec2(
-      fbm(uv+q*warp+vec2(sin(t*0.4)*1.1+1.7, cos(t*0.5)*1.2+9.2),4),
-      fbm(uv+q*warp+vec2(cos(t*0.8)*0.9+8.3, sin(t*1.1)*1.0+2.8),4)
-    );
-    return fbm(uv+r*warp+vec2(sin(t*0.7)*0.3,cos(t*0.3)*0.3),4);
+    float w=1.9;
+    float s1=sin(t*.7),c1=cos(t*.5),s2=sin(t*.4),c2=cos(t*.9);
+    float s3=sin(t*1.1),c3=cos(t*.3),s4=sin(t*.6),c4=cos(t*.8);
+    vec2 q=vec2(fbm(uv+vec2(s1*1.2,c2*1.1),4),
+                fbm(uv+vec2(c3+5.2,s4*1.3+1.3),4));
+    vec2 r=vec2(fbm(uv+q*w+vec2(s2*1.1+1.7,c1*1.2+9.2),4),
+                fbm(uv+q*w+vec2(c4*.9+8.3,s3+2.8),4));
+    return fbm(uv+r*w+vec2(s1*.3,c3*.3),4);
   }
 
   void main(){
     vec2 uv = vUV;
     vec2 flippedUV = vec2(uv.x, uv.y);
 
-    // Warp the mask lookup at edges to create patchy fragmented boundary
-    float edgeNoise = fbm(uv*12.0 + vec2(uTime*0.3, uTime*0.2), 3) * 0.04;
-    vec2 warpedMaskUV = flippedUV + vec2(edgeNoise, edgeNoise);
-    float mask = texture2D(uMask, warpedMaskUV).r;
-    // Sharpen the mask slightly so warping creates real gaps not just blur
-    mask = smoothstep(0.2, 0.7, mask);
-    float edge = texture2D(uEdge, flippedUV).r;
+    // Sample mask + compute gradient for flow direction
+    float texel = 1.0/256.0;
+    float m0  = texture2D(uMask, flippedUV).r;
+    float mR  = texture2D(uMask, flippedUV+vec2(texel,0)).r;
+    float mL  = texture2D(uMask, flippedUV-vec2(texel,0)).r;
+    float mU  = texture2D(uMask, flippedUV+vec2(0,texel)).r;
+    float mD  = texture2D(uMask, flippedUV-vec2(0,texel)).r;
 
-    vec2 warpUV = uv * 8.0;
+    // Gradient of mask = direction perpendicular to body edge
+    vec2 grad = vec2(mR-mL, mU-mD);
+    float gradLen = length(grad);
+    vec2 flowDir = gradLen > 0.001 ? grad/gradLen : vec2(0.);
+
+    // Warped mask edge — patchy fragmented boundary
+    float edgeNoise = fbm(uv*12.0+vec2(uTime*.3,uTime*.2),3)*0.05;
+    float warpedMask = texture2D(uMask, flippedUV+vec2(edgeNoise)).r;
+    float sharpMask  = smoothstep(0.2, 0.7, warpedMask);
+
+    // Extended smoke region — beyond body boundary
+    float smokeDist = 0.18; // how far smoke extends
+    vec2 smokeUV = flippedUV - normalize(grad+vec2(0.001))*smokeDist;
+    float smokeMask = texture2D(uMask, smokeUV).r;
+    // Smoke only where we're outside the body
+    float outsideMask = 1.0 - smoothstep(0.3, 0.7, m0);
+    // Smoke intensity driven by noise — patchy not uniform
+    float smokeNoise = domainWarp(uv*6.0+vec2(uTime*.15), uTime);
+    smokeNoise = clamp(smokeNoise*0.5+0.5-0.3,0.,1.)/0.7;
+    // Falloff — smoke gets weaker further from body
+    float distFromBody = 1.0-clamp(m0*3.0,0.,1.);
+    float smoke = outsideMask * smokeMask * smokeNoise * (1.0-distFromBody*0.8) * 0.5;
+
+    // Radial falloff from body center
+    // Approximate center as where mask is strongest
+    float radialFalloff = smoothstep(0.0, 0.9, m0);
+
+    // Noise oriented along body contour using flow direction
+    vec2 warpUV = uv*8.0 + flowDir*1.5;
     float tex = domainWarp(warpUV, uTime);
-    float raw = clamp(tex*0.5+0.5 - 0.33, 0., 1.) / 0.67;
-    tex = pow(raw, 3.5);
+    float raw = clamp(tex*0.5+0.5-0.33,0.,1.)/0.67;
+    tex = pow(raw, 3.0);
 
-    // Sample clean unwarped mask for edge gating — only show edges in interior
-    float cleanMask = texture2D(uMask, flippedUV).r;
-    float interiorMask = smoothstep(0.4, 0.8, cleanMask); // only strong mask areas
-    float darkEdge = edge * interiorMask * 0.35;
+    // Modulate texture by radial falloff — dense core, dissolves outward
+    tex *= (0.4 + radialFalloff*0.6);
 
-    float combined = mask * tex - darkEdge;
-    combined = clamp(combined, 0., 1.);
+    // Edge detail — white lines, interior only
+    float edge = texture2D(uEdge, flippedUV).r;
+    float interiorMask = smoothstep(0.4,0.8,m0);
+    float edgeDetail = edge * interiorMask * 0.18;
+
+    // Combine body + smoke
+    float bodyVal = sharpMask * tex + edgeDetail;
+    float combined = clamp(bodyVal + smoke, 0., 1.);
 
     float lum = combined;
-
     float tint = 0.51;
     vec3 col = vec3(
       lum*(1.-tint*0.35),
       lum*(1.-tint*0.15),
-      min(1., lum*(1.+tint*0.22))
+      min(1.,lum*(1.+tint*0.22))
     );
 
-    gl_FragColor = vec4(col, 1.);
+    gl_FragColor = vec4(col,1.);
   }
 `;
 
-function compileShader(type, src){
+function compileShader(type,src){
   const s=gl.createShader(type);
-  gl.shaderSource(s,src);
-  gl.compileShader(s);
-  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))
-    console.error(gl.getShaderInfoLog(s));
+  gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(s));
   return s;
 }
 const prog=gl.createProgram();
 gl.attachShader(prog,compileShader(gl.VERTEX_SHADER,vsSource));
 gl.attachShader(prog,compileShader(gl.FRAGMENT_SHADER,fsSource));
-gl.linkProgram(prog);
-gl.useProgram(prog);
+gl.linkProgram(prog);gl.useProgram(prog);
 
 const quad=new Float32Array([-1,-1,1,-1,-1,1,1,1]);
 const buf=gl.createBuffer();
@@ -150,9 +167,9 @@ const aPos=gl.getAttribLocation(prog,'aPos');
 gl.enableVertexAttribArray(aPos);
 gl.vertexAttribPointer(aPos,2,gl.FLOAT,false,0,0);
 
-const uMask=gl.getUniformLocation(prog,'uMask');
-const uEdge=gl.getUniformLocation(prog,'uEdge');
-const uTime=gl.getUniformLocation(prog,'uTime');
+const uMaskLoc=gl.getUniformLocation(prog,'uMask');
+const uEdgeLoc=gl.getUniformLocation(prog,'uEdge');
+const uTimeLoc=gl.getUniformLocation(prog,'uTime');
 
 function makeTex(unit){
   const t=gl.createTexture();
@@ -166,94 +183,77 @@ function makeTex(unit){
 }
 const maskTex=makeTex(0);
 const edgeTex=makeTex(1);
-gl.uniform1i(uMask,0);
-gl.uniform1i(uEdge,1);
+gl.uniform1i(uMaskLoc,0);
+gl.uniform1i(uEdgeLoc,1);
 
-// ── Segmentation ───────────────────────────────────────────────
 const statusEl=document.getElementById('status');
 const fpsEl=document.getElementById('fps');
 const webcam=document.getElementById('webcam');
+let segmenter=null,running=false;
+let frameCount=0,lastTime=performance.now();
 
-let segmenter=null, running=false;
-let frameCount=0, lastTime=performance.now();
-let animT=0;
-
-// Low res seg canvas
-const SEG_W=256, SEG_H=192;
+const SEG_W=256,SEG_H=192;
 const segCanvas=document.createElement('canvas');
-segCanvas.width=SEG_W; segCanvas.height=SEG_H;
+segCanvas.width=SEG_W;segCanvas.height=SEG_H;
 const segCtx=segCanvas.getContext('2d',{willReadFrequently:true});
 
-// Edge canvas at half res for speed
-const EDGE_W=320, EDGE_H=240;
+const EDGE_W=320,EDGE_H=240;
 const edgeCanvas=document.createElement('canvas');
-edgeCanvas.width=EDGE_W; edgeCanvas.height=EDGE_H;
+edgeCanvas.width=EDGE_W;edgeCanvas.height=EDGE_H;
 const edgeCtx=edgeCanvas.getContext('2d',{willReadFrequently:true});
 
-// Mask texture data
 const maskData=new Uint8Array(SEG_W*SEG_H*4);
 const edgeImgData=new Uint8Array(EDGE_W*EDGE_H*4);
-
 let edgeFrame=0;
 
 function uploadMask(segData){
   for(let i=0;i<SEG_W*SEG_H;i++){
     const v=segData[i]?255:0;
-    maskData[i*4]=v; maskData[i*4+1]=v;
-    maskData[i*4+2]=v; maskData[i*4+3]=255;
+    maskData[i*4]=v;maskData[i*4+1]=v;maskData[i*4+2]=v;maskData[i*4+3]=255;
   }
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D,maskTex);
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
   gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,SEG_W,SEG_H,0,gl.RGBA,gl.UNSIGNED_BYTE,maskData);
 }
 
 function uploadEdge(){
-  // Only every other seg frame
   edgeFrame++;
-  if(edgeFrame%2!==0) return;
-
+  if(edgeFrame%2!==0)return;
   edgeCtx.save();
-  edgeCtx.translate(EDGE_W,0);
-  edgeCtx.scale(-1,1);
+  edgeCtx.translate(EDGE_W,0);edgeCtx.scale(-1,1);
   edgeCtx.drawImage(webcam,0,0,EDGE_W,EDGE_H);
   edgeCtx.restore();
   const raw=edgeCtx.getImageData(0,0,EDGE_W,EDGE_H);
   const d=raw.data;
-
   for(let y=1;y<EDGE_H-1;y++){
     for(let x=1;x<EDGE_W-1;x++){
       const i=(y*EDGE_W+x)*4;
       const gx=d[(y*EDGE_W+x+1)*4]-d[(y*EDGE_W+x-1)*4];
       const gy=d[((y+1)*EDGE_W+x)*4]-d[((y-1)*EDGE_W+x)*4];
       const e=Math.min(255,Math.sqrt(gx*gx+gy*gy)*1.5);
-      edgeImgData[i]=e; edgeImgData[i+1]=e;
-      edgeImgData[i+2]=e; edgeImgData[i+3]=255;
+      edgeImgData[i]=e;edgeImgData[i+1]=e;edgeImgData[i+2]=e;edgeImgData[i+3]=255;
     }
   }
   gl.activeTexture(gl.TEXTURE1);
   gl.bindTexture(gl.TEXTURE_2D,edgeTex);
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
   gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,EDGE_W,EDGE_H,0,gl.RGBA,gl.UNSIGNED_BYTE,edgeImgData);
 }
 
-// ── Render loop (GPU) ──────────────────────────────────────────
 function renderLoop(ts){
-  animT = ts/1000 * 0.22;
-  gl.uniform1f(uTime, animT);
+  gl.uniform1f(uTimeLoc,ts/1000*0.22);
   gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
   requestAnimationFrame(renderLoop);
 }
 
-// ── Seg loop (CPU, async) ──────────────────────────────────────
 let processing=false;
 async function segLoop(){
-  if(!running) return;
-  if(!processing && webcam.readyState>=2){
+  if(!running)return;
+  if(!processing&&webcam.readyState>=2){
     processing=true;
     segCtx.save();
-    segCtx.translate(SEG_W,0);
-    segCtx.scale(-1,1);
+    segCtx.translate(SEG_W,0);segCtx.scale(-1,1);
     segCtx.drawImage(webcam,0,0,SEG_W,SEG_H);
     segCtx.restore();
     try{
@@ -263,7 +263,7 @@ async function segLoop(){
           seg,{r:255,g:255,b:255,a:255},{r:0,g:0,b:0,a:255},false,0.5
         );
         const segData=new Uint8Array(SEG_W*SEG_H);
-        for(let i=0;i<SEG_W*SEG_H;i++) segData[i]=fg.data[i*4]>128?1:0;
+        for(let i=0;i<SEG_W*SEG_H;i++)segData[i]=fg.data[i*4]>128?1:0;
         uploadMask(segData);
         uploadEdge();
         frameCount++;
@@ -276,14 +276,13 @@ async function segLoop(){
   setTimeout(segLoop,0);
 }
 
-// ── Init ───────────────────────────────────────────────────────
 async function init(){
   document.getElementById('startBtn').style.display='none';
   statusEl.textContent='loading model...';
   try{
     segmenter=await bodySegmentation.createSegmenter(
       bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation,
-      {runtime:'tfjs', modelType:'general'}
+      {runtime:'tfjs',modelType:'general'}
     );
     statusEl.textContent='model ready — requesting camera...';
   }catch(e){
