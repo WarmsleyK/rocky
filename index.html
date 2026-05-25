@@ -96,43 +96,35 @@ const fsSource = `
     float gradLen = length(grad);
     vec2 flowDir = gradLen > 0.001 ? grad/gradLen : vec2(0.);
 
-    // Warped mask edge — patchy fragmented boundary
-    float edgeNoise = fbm(uv*12.0+vec2(uTime*.3,uTime*.2),3)*0.05;
+    // Warped mask edge — softer patchy boundary like previous version
+    float edgeNoise = fbm(uv*10.0+vec2(uTime*.25,uTime*.18),3)*0.04;
     float warpedMask = texture2D(uMask, flippedUV+vec2(edgeNoise)).r;
-    float sharpMask  = smoothstep(0.2, 0.7, warpedMask);
+    float sharpMask = smoothstep(0.25, 0.65, warpedMask);
 
-    // Extended smoke region — beyond body boundary
-    float smokeDist = 0.18; // how far smoke extends
-    vec2 smokeUV = flippedUV - normalize(grad+vec2(0.001))*smokeDist;
-    float smokeMask = texture2D(uMask, smokeUV).r;
-    // Smoke only where we're outside the body
-    float outsideMask = 1.0 - smoothstep(0.3, 0.7, m0);
-    // Smoke intensity driven by noise — patchy not uniform
-    float smokeNoise = domainWarp(uv*6.0+vec2(uTime*.15), uTime);
-    smokeNoise = clamp(smokeNoise*0.5+0.5-0.3,0.,1.)/0.7;
-    // Falloff — smoke gets weaker further from body
-    float distFromBody = 1.0-clamp(m0*3.0,0.,1.);
-    float smoke = outsideMask * smokeMask * smokeNoise * (1.0-distFromBody*0.8) * 0.5;
+    // Smoke — tendrils visibly outside silhouette
+    // Sample mask at a point pulled inward — if that's inside body, we're in smoke zone
+    float smokeReach = 0.12;
+    vec2 inwardUV = flippedUV + normalize(grad+vec2(0.001))*smokeReach;
+    float inwardMask = texture2D(uMask, inwardUV).r;
+    float inSmoke = smoothstep(0.3, 0.6, inwardMask) * (1.0-smoothstep(0.3,0.6,m0));
+    float smokeNoise = domainWarp(uv*5.0, uTime*0.8);
+    smokeNoise = clamp(smokeNoise*0.5+0.5-0.2,0.,1.)/0.8;
+    float smoke = inSmoke * smokeNoise * 0.45;
 
-    // Radial falloff from body center
-    // Approximate center as where mask is strongest
+    // Radial falloff — dense core dissolves toward edges
     float radialFalloff = smoothstep(0.0, 0.9, m0);
 
-    // Noise oriented along body contour using flow direction
     vec2 warpUV = uv*8.0 + flowDir*1.5;
     float tex = domainWarp(warpUV, uTime);
     float raw = clamp(tex*0.5+0.5-0.33,0.,1.)/0.67;
     tex = pow(raw, 3.0);
-
-    // Modulate texture by radial falloff — dense core, dissolves outward
     tex *= (0.4 + radialFalloff*0.6);
 
-    // Edge detail — white lines, interior only
+    // White outlines — boosted so they're visible
     float edge = texture2D(uEdge, flippedUV).r;
     float interiorMask = smoothstep(0.4,0.8,m0);
-    float edgeDetail = edge * interiorMask * 0.18;
+    float edgeDetail = edge * interiorMask * 0.3;
 
-    // Combine body + smoke
     float bodyVal = sharpMask * tex + edgeDetail;
     float combined = clamp(bodyVal + smoke, 0., 1.);
 
