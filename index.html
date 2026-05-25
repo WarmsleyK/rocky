@@ -82,49 +82,28 @@ const fsSource = `
   void main(){
     vec2 uv = vUV;
 
-    // Sample mask at expanded radius for smoke zone
-    float m0 = texture2D(uMask, uv).r;
-
-    // Smoke: sample mask pulled inward by a noisy offset
-    // If that inward point is inside body but current point is outside — smoke zone
-    float smokeRadius = 0.08;
-    float smokeNoise2 = fbm(uv*7.0+vec2(uTime*.2,uTime*.13),3);
-    float noisyRadius = smokeRadius*(0.4+smokeNoise2*0.6);
-    vec2 inward = uv + normalize(uv-vec2(0.5))*(-noisyRadius);
-    inward = clamp(inward,0.,1.);
-    float mInward = texture2D(uMask, inward).r;
-
-    float outsideBody = 1.0-smoothstep(0.3,0.6,m0);
-    float nearBody    = smoothstep(0.3,0.6,mInward);
-    float smokeVal    = outsideBody * nearBody;
-
-    // Smoke driven by domain warp noise, patchy not uniform
-    float smokeTex = domainWarp(uv*5.0, uTime*0.7);
-    smokeTex = clamp(smokeTex*0.5+0.5-0.25,0.,1.)/0.75;
-    smokeTex = pow(smokeTex,1.5);
-    float smoke = smokeVal * smokeTex * 0.5;
-
-    // Body mask — noisy edge for organic boundary
+    // Noisy mask edge for organic boundary
     float edgeNoise = fbm(uv*10.0+vec2(sin(uTime*.25),cos(uTime*.18)),3)*0.04;
     float warpedMask = texture2D(uMask, uv+vec2(edgeNoise)).r;
-    float sharpMask  = smoothstep(0.25, 0.65, warpedMask);
+    float mask = smoothstep(0.25, 0.65, warpedMask);
 
-    // Radial falloff — bright core dissolves to edges
-    float radial = smoothstep(0.0,0.85,m0);
+    // Radial falloff — bright core dissolves toward edges
+    float m0 = texture2D(uMask, uv).r;
+    float radial = smoothstep(0.0, 0.85, m0);
 
     // Body texture
     vec2 warpUV = uv*8.0;
     float tex = domainWarp(warpUV, uTime);
     float raw = clamp(tex*0.5+0.5-0.33,0.,1.)/0.67;
-    tex = pow(raw,3.0);
+    tex = pow(raw, 3.0);
     tex *= (0.35+radial*0.65);
 
-    // White edge detail — interior only
+    // White edge detail — interior only, subtle
     float edge = texture2D(uEdge, uv).r;
     float interior = smoothstep(0.4,0.8,m0);
     float edgeDetail = edge*interior*0.28;
 
-    float combined = clamp(sharpMask*tex + edgeDetail + smoke, 0.,1.);
+    float combined = clamp(mask*tex + edgeDetail, 0.,1.);
 
     float lum = combined;
     float tint = 0.51;
